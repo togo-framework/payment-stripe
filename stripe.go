@@ -1,10 +1,14 @@
 // Package stripe is a Stripe driver for togo payment. Blank-import it and set
-// PAYMENT_DRIVER=stripe, STRIPE_SECRET_KEY. (For production, verify webhook
-// signatures with STRIPE_WEBHOOK_SECRET.)
+// PAYMENT_DRIVER=stripe, STRIPE_SECRET_KEY. Set STRIPE_WEBHOOK_SECRET to verify
+// webhook signatures (Stripe-Signature header); optional STRIPE_BASE_URL overrides
+// the API base (defaults to the live Stripe API).
 package stripe
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +24,7 @@ import (
 	"github.com/togo-framework/togo"
 )
 
-const api = "https://api.stripe.com/v1"
+const defaultAPI = "https://api.stripe.com/v1"
 
 func init() {
 	payment.RegisterDriver("stripe", func(k *togo.Kernel) (payment.PaymentProvider, error) {
@@ -28,23 +32,42 @@ func init() {
 		if key == "" {
 			return nil, errors.New("payment-stripe: STRIPE_SECRET_KEY not set")
 		}
-		return &provider{key: key, hc: &http.Client{Timeout: 20 * time.Second}}, nil
+		base := os.Getenv("STRIPE_BASE_URL")
+		if base == "" {
+			base = defaultAPI
+		}
+		return &provider{
+			key:      key,
+			base:     strings.TrimRight(base, "/"),
+			whSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
+			hc:       &http.Client{Timeout: 20 * time.Second},
+		}, nil
 	})
 }
 
 type provider struct {
-	key string
-	hc  *http.Client
+	key      string
+	base     string
+	whSecret string
+	hc       *http.Client
 }
 
 func (p *provider) post(ctx context.Context, path string, form url.Values) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api+path, strings.NewReader(form.Encode()))
+	base := p.base
+	if base == "" {
+		base = defaultAPI
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+p.key)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := p.hc.Do(req)
+	hc := p.hc
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +173,16 @@ func (p *provider) CreateSubscription(ctx context.Context, r payment.Subscriptio
 	return &payment.Subscription{ID: id, Status: status, PlanID: r.PlanID, Provider: "stripe"}, nil
 }
 
-func (p *provider) HandleWebhook(_ context.Context, _ map[string]string, body []byte) (*payment.WebhookEvent, error) {
+// HandleWebhook parses a Stripe event. When STRIPE_WEBHOOK_SECRET is configured
+// it verifies the Stripe-Signature header (t=…,v1=HMAC-SHA256(t + "." + body));
+// with no secret set it parses without verification (dev convenience).
+func (p *provider) HandleWebhook(_ context.Context, headers map[string]string, body []byte) (*payment.WebhookEvent, error) {
+	if p.whSecret != "" {
+		sig := headerGet(headers, "Stripe-Signature")
+		if sig == "" || !verifyStripeSig(sig, body, p.whSecret) {
+			return nil, errors.New("payment-stripe: invalid webhook signature")
+		}
+	}
 	var ev map[string]any
 	if err := json.Unmarshal(body, &ev); err != nil {
 		return nil, err
@@ -158,4 +190,46 @@ func (p *provider) HandleWebhook(_ context.Context, _ map[string]string, body []
 	typ, _ := ev["type"].(string)
 	id, _ := ev["id"].(string)
 	return &payment.WebhookEvent{Type: typ, ID: id, Provider: "stripe", Raw: ev}, nil
+}
+
+func headerGet(h map[string]string, key string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
+}
+
+// signStripe computes the Stripe v1 webhook signature for a payload at time t.
+func signStripe(secret string, t int64, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(mac, "%d.%s", t, body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// verifyStripeSig validates a Stripe-Signature header value against body+secret.
+func verifyStripeSig(header string, body []byte, secret string) bool {
+	var ts, v1 string
+	for _, part := range strings.Split(header, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "t":
+			ts = kv[1]
+		case "v1":
+			v1 = kv[1]
+		}
+	}
+	if ts == "" || v1 == "" {
+		return false
+	}
+	t, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return false
+	}
+	expected := signStripe(secret, t, body)
+	return hmac.Equal([]byte(expected), []byte(v1))
 }
